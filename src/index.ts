@@ -11,7 +11,7 @@ export interface Env extends GitHubAppEnv {
   PR_COORDINATOR: DurableObjectNamespace<PrReviewCoordinator>;
   GITHUB_WEBHOOK_SECRET?: string;
   AI_GATEWAY_NAME?: string;
-  // Noul-probability floor above which Jev's triage call routes a diff to
+  // Noul-probability floor above which Clef's triage call routes a diff to
   // the corresponding specialist. Lower = more cautious (runs the
   // committee more often); higher = cheaper but more likely to skip a real
   // dependency_bump/docs-only false negative. 0.5 is a starting point, not
@@ -61,7 +61,7 @@ export default {
       <li><strong>1. Gitleaks-pattern Secret Scan</strong><span class="tag heuristic">HEURISTIC</span> — regex/entropy rules modeled on Gitleaks' public default ruleset. Blocks the PR on hardcoded API keys, tokens, and private keys.</li>
       <li><strong>2. OSV.dev Vulnerability Lookup</strong><span class="tag real">REAL</span> — new/changed <code>package.json</code> dependencies are queried live against <a href="https://osv.dev" style="color:#fe5e1e">osv.dev</a>'s public vulnerability database.</li>
       <li><strong>3. Hard-Rails File Filter</strong><span class="tag heuristic">HEURISTIC</span> — Alibaba-OCR-style noise reduction (lockfiles, bundles, vendor code). Not a Semgrep integration; SAST-style reasoning happens in the LLM pass below.</li>
-      <li><strong>3.5. Jev Triage Gate</strong><span class="tag real">REAL</span> — <a href="https://developers.cloudflare.com/ai/models/typesafe/jev/" style="color:#fe5e1e">typesafe/jev</a> (Cloudflare's calibrated decision model) judges whether this diff needs the security specialist, the quality specialist, both, or neither — a docs-only or dependency-bump PR skips the expensive committee entirely. Deterministic findings (OSV.dev, policy gate) always force a security pass regardless of what Jev says.</li>
+      <li><strong>3.5. Clef Triage Gate</strong><span class="tag real">REAL</span> — <a href="https://developers.cloudflare.com/workers-ai/models/clef-flash/" style="color:#fe5e1e">clef-flash</a> (Cloudflare's open-source decision model) judges whether this diff needs the security specialist, the quality specialist, both, or neither — a docs-only or dependency-bump PR skips the expensive committee entirely. Deterministic findings (OSV.dev, policy gate) always force a security pass regardless of what Clef says.</li>
       <li><strong>4. OPA-inspired Policy Gate</strong><span class="tag heuristic">HEURISTIC</span> — flags changes to CI/CD workflows, auth code, or infra config, and PRs over a blast-radius file-count threshold.</li>
       <li><strong>5. Mantis-style Reachability Check</strong><span class="tag real">REAL context, heuristic reasoning</span> — pulls full file content (not just the diff hunk) from the GitHub Contents API so the security model can judge whether a flaw is actually reachable.</li>
       <li><strong>6. OWASP-ASRH-style Regression Check</strong><span class="tag heuristic">HEURISTIC</span> — the Lead Arbiter is instructed to verify proposed fixes introduce no secondary vulnerabilities before posting.</li>
@@ -246,9 +246,9 @@ function evaluateOpaPolicy(parsedFiles: parseDiff.File[]): string[] {
   return policyViolations;
 }
 
-// Jev Triage Gate — decides which specialist(s) actually need to run.
-// typesafe/jev (https://developers.cloudflare.com/ai/models/typesafe/jev/)
-// is a text-only decision model: cheap, calibrated Noul/Choice judgments,
+// Clef Triage Gate — decides which specialist(s) actually need to run.
+// clef-flash (https://developers.cloudflare.com/workers-ai/models/clef-flash/)
+// is Cloudflare's first-party decision model: cheap, calibrated Noul/Choice judgments,
 // not a code generator. It can't replace DeepSeek-R1 or Qwen's reasoning —
 // it sits in front of them as a cascade gate, the same shape as the other
 // two Episode 5 bonus tracks (clawbuilders-story-agent's redaction pass,
@@ -262,7 +262,7 @@ interface TriageResult {
   qualityNoul: number;
   // Which tier actually produced this judgment — surfaced in the posted
   // comment so a degraded run is never mistaken for a normal one.
-  source: 'jev' | 'fallback-model' | 'fail-open';
+  source: 'clef' | 'fallback-model' | 'fail-open';
 }
 
 interface RawTriageAnswer {
@@ -290,15 +290,16 @@ const TRIAGE_CATEGORIES = {
   test_only: 'Only adds or modifies tests',
 } as const;
 
-async function triageWithJev(
+async function triageWithClef(
   ai: any,
   reviewableFiles: parseDiff.File[],
   diffHunk: string,
   gatewayOpts: any
 ): Promise<RawTriageAnswer> {
   const response = await ai.run(
-    'typesafe/jev',
+    '@cf/cloudflare/clef-flash',
     {
+      model: 'clef-flash',
       state: {
         files_changed: reviewableFiles.map((f) => f.to || f.from || '').filter(Boolean),
         diff_hunk: diffHunk.slice(0, 4000),
@@ -335,14 +336,12 @@ async function triageWithJev(
   };
 }
 
-// Free-tier fallback — Jev is a third-party model billed through AI
-// Gateway's Unified Billing (no free tier; purchased credits only,
-// separate from Workers AI's free Neurons allowance). If that call fails
-// for any reason (including "insufficient credits"), fall back to a
+// Fallback — if the Clef call fails for any reason (capacity, schema
+// drift, quota), fall back to a
 // first-party model already proven to work on the free tier in this exact
 // pipeline (the Lead Arbiter below uses the same one) and ask it to
 // approximate the same yes/no/category judgment as plain JSON. Less
-// calibrated than Jev's actual probabilities, but keeps the triage gate
+// calibrated than Clef's actual probabilities, but keeps the triage gate
 // functioning without a paid dependency.
 async function triageWithFallbackModel(
   ai: any,
@@ -394,7 +393,7 @@ needs_quality_review: true if a human reviewer would likely have substantive sty
   };
 }
 
-// Orchestrates the cascade: Jev (cheap, calibrated) → free-tier model
+// Orchestrates the cascade: Clef (cheap, calibrated) → free-tier model
 // fallback (cheaper still, less calibrated) → fail open (run the full
 // committee) if even that errors. Never silently drops a review — the
 // previous version of this gate had no fallback at all, so any Jev-layer
@@ -409,7 +408,7 @@ async function runTriage(
   escalationFloor: number,
   gatewayOpts: any
 ): Promise<TriageResult> {
-  // Jev can only ADD scrutiny, never suppress a real deterministic finding —
+  // Clef can only ADD scrutiny, never suppress a real deterministic finding —
   // if OSV.dev or the policy gate already flagged something concrete, the
   // security specialist runs regardless of what any triage tier says.
   const forcedBySignal = policyAlerts.length > 0 || vulnerabilityFindings.length > 0;
@@ -424,13 +423,13 @@ async function runTriage(
   });
 
   try {
-    const raw = await triageWithJev(ai, reviewableFiles, diffHunk, gatewayOpts);
+    const raw = await triageWithClef(ai, reviewableFiles, diffHunk, gatewayOpts);
     return finalize(
       { ...raw, needsSecurity: raw.securityNoul >= escalationFloor, needsQuality: raw.qualityNoul >= escalationFloor },
-      'jev'
+      'clef'
     );
-  } catch (jevErr: any) {
-    console.error('Jev triage failed, falling back to free-tier model:', jevErr?.message ?? jevErr);
+  } catch (clefErr: any) {
+    console.error('Clef triage failed, falling back to free-tier model:', clefErr?.message ?? clefErr);
   }
 
   try {
@@ -879,9 +878,9 @@ export class PrReviewCoordinator extends DurableObject<Env> {
       const diffHunk = JSON.stringify(reviewableFiles.slice(0, 5));
       const numberedDiff = renderNumberedDiff(reviewableFiles.slice(0, 5));
 
-      // ── JEV TRIAGE GATE: which specialist(s) does this diff actually need? ──
-      // Falls back through a free-tier model, then fails open, if Jev itself
-      // is unavailable (e.g. AI Gateway credits) — see the `triage()` doc
+      // ── CLEF TRIAGE GATE: which specialist(s) does this diff actually need? ──
+      // Falls back through a free-tier model, then fails open, if Clef itself
+      // is unavailable — see the `triage()` doc
       // comment above for the full cascade.
       const escalationFloor = parseFloat(this.env.JEV_ESCALATION_FLOOR ?? '0.5') || 0.5;
       const triage = await runTriage(
@@ -895,13 +894,13 @@ export class PrReviewCoordinator extends DurableObject<Env> {
       );
       const triageSourceNote =
         triage.source === 'fallback-model'
-          ? ' _(Jev was unavailable this run — triage fell back to a free-tier model instead.)_'
+          ? ' _(Clef was unavailable this run — triage fell back to a free-tier model instead.)_'
           : triage.source === 'fail-open'
-            ? ' _(Both Jev and the free-tier fallback were unavailable — running the full committee to be safe rather than skipping.)_'
+            ? ' _(Both Clef and the free-tier fallback were unavailable — running the full committee to be safe rather than skipping.)_'
             : '';
 
       if (!triage.needsSecurity && !triage.needsQuality) {
-        const skipSummary = `### 🛡️ AI Review Committee — Jev Triage\n\n[typesafe/jev](https://developers.cloudflare.com/ai/models/typesafe/jev/) classified this as a **${triage.category}** change with no security or code-quality signal worth a full multi-model review (security confidence ${triage.securityNoul.toFixed(2)}, quality confidence ${triage.qualityNoul.toFixed(2)}). Skipping DeepSeek-R1 + Qwen 2.5 Coder for this PR.${triageSourceNote}\n\n_Deterministic checks (secret scan, OSV.dev, policy gate) already ran above and would have forced a full review automatically if any of them had found something._`;
+        const skipSummary = `### 🛡️ AI Review Committee — Clef Triage\n\n[clef-flash](https://developers.cloudflare.com/workers-ai/models/clef-flash/) classified this as a **${triage.category}** change with no security or code-quality signal worth a full multi-model review (security confidence ${triage.securityNoul.toFixed(2)}, quality confidence ${triage.qualityNoul.toFixed(2)}). Skipping DeepSeek-R1 + Qwen 2.5 Coder for this PR.${triageSourceNote}\n\n_Deterministic checks (secret scan, OSV.dev, policy gate) already ran above and would have forced a full review automatically if any of them had found something._`;
         this.ctx.storage.sql.exec(
           'INSERT INTO reviews (commit_sha, summary) VALUES (?, ?)',
           pr.head.sha,
@@ -927,7 +926,7 @@ export class PrReviewCoordinator extends DurableObject<Env> {
         : '';
 
       // ── MULTI-MODEL PARALLEL EVALUATION (Promise.all) ──────────────────────
-      // Each specialist only runs if the Jev triage gate above said it's
+      // Each specialist only runs if the Clef triage gate above said it's
       // needed — a docs-only or dependency-bump PR skips both and never
       // reaches this point at all (see the early return above).
       const [securityReport, codeReport] = await Promise.all([
@@ -975,7 +974,7 @@ Only cite numbered lines. Omit "suggestion" if the fix can't be expressed as a r
         ? anchorFindings(parseInlineFindings(codeReport.response), reviewableFiles)
         : [];
       const codeReportSummary = !codeReport
-        ? 'Skipped — Jev triage found no substantive quality signal in this diff'
+        ? 'Skipped — Clef triage found no substantive quality signal in this diff'
         : inlineFindings.length === 0
           ? 'No substantive issues found'
           : inlineFindings.map((f) => `${f.path}:${f.line} — ${f.title}: ${f.body}`).join('\n');
@@ -989,7 +988,7 @@ Only cite numbered lines. Omit "suggestion" if the fix can't be expressed as a r
 - OPA-style Policy & Blast Radius: ${policyAlerts.length > 0 ? policyAlerts.join('; ') : 'Safe scope'}
 - OSV.dev Vulnerability Lookup: ${vulnerabilityFindings.length > 0 ? vulnerabilityFindings.join('; ') : 'No known vulnerabilities in changed dependencies'}
 - OpenSSF Scorecard Supply-Chain Check: ${scorecardFindings.length > 0 ? scorecardFindings.join('; ') : 'No low-scoring dependencies flagged'}
-- Security Specialist (Mantis-style reachability): ${securityReport ? securityReport.response : 'Skipped — Jev triage found no plausible security signal in this diff'}
+- Security Specialist (Mantis-style reachability): ${securityReport ? securityReport.response : 'Skipped — Clef triage found no plausible security signal in this diff'}
 - Code Quality Specialist (Qwen 2.5 Coder): ${codeReportSummary}
 ${inlineFindings.length > 0 ? `\nThe Code Quality findings above are already posted as inline comments with one-click suggestions on the exact lines — reference them briefly, do not repeat their code fixes.\n` : ''}
 
@@ -1013,7 +1012,7 @@ Apply this checklist silently. Output ONLY the final review a developer reads: a
 
       // Post final review back to GitHub PR
       if (githubToken) {
-        const reviewBody = `### 🛡️ AI Review Committee (7-Pillar Security Suite)\n*Gitleaks-pattern • OSV.dev (live) • Hard-Rails Filter • Jev Triage Gate • OPA-inspired Policy • Mantis-style Reachability • OWASP-ASRH-style Regression • OpenSSF Scorecard (live)*\n\n${!triage.needsSecurity ? '_Security specialist skipped by Jev triage for this PR._\n\n' : ''}${!triage.needsQuality ? '_Code quality specialist skipped by Jev triage for this PR._\n\n' : ''}${triageSourceNote ? triageSourceNote.trim() + '\n\n' : ''}${finalSynthesis.response}`;
+        const reviewBody = `### 🛡️ AI Review Committee (7-Pillar Security Suite)\n*Gitleaks-pattern • OSV.dev (live) • Hard-Rails Filter • Clef Triage Gate • OPA-inspired Policy • Mantis-style Reachability • OWASP-ASRH-style Regression • OpenSSF Scorecard (live)*\n\n${!triage.needsSecurity ? '_Security specialist skipped by Clef triage for this PR._\n\n' : ''}${!triage.needsQuality ? '_Code quality specialist skipped by Clef triage for this PR._\n\n' : ''}${triageSourceNote ? triageSourceNote.trim() + '\n\n' : ''}${finalSynthesis.response}`;
         const posted = await postPrReview(repoFullName, pr.number, pr.head.sha, githubToken, reviewBody, inlineFindings);
         if (!posted) {
           // Inline anchoring failed (e.g. a stale head SHA) — still deliver the
