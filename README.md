@@ -1,225 +1,223 @@
-# Cloudflare Code Review Agent (Alibaba OCR + 7-Pillar Security Suite)
+# Cloudflare Code Review Agent
 
-> A 24/7 automated GitHub PR code reviewer living on Cloudflare Workers, powered by SQLite Durable Objects, Workers AI, and inspired by **Alibaba's [open-code-review (OCR)](https://github.com/alibaba/open-code-review)** architecture guarded by a **7-Pillar Defense-in-Depth Suite**.
+An automated GitHub pull-request reviewer that runs entirely on Cloudflare's free tier: Workers, SQLite Durable Objects, and Workers AI. Every PR passes through deterministic security checks, a [Clef](https://developers.cloudflare.com/workers-ai/models/clef-flash/) triage gate, and a multi-model review committee. The result is posted back to GitHub as a review with inline, one-click **Commit suggestion** fixes.
 
-Built for [ClawBuilders](https://clawbuilder.club) S1:E5 — [Deploy AI Agents with Cloudflare](https://clawbuilder.club/events/s1/ep5/deploy-ai-agents-with-cloudflare).
+Forked from [Clawbuilders/cloudflare-code-reviewer](https://github.com/Clawbuilders/cloudflare-code-reviewer), built for [ClawBuilders](https://clawbuilder.club) S1:E5 — [Deploy AI Agents with Cloudflare](https://clawbuilder.club/events/s1/ep5/deploy-ai-agents-with-cloudflare).
 
----
+**See it working** on [kravchuk-ivan/cf-review-demo](https://github.com/kravchuk-ivan/cf-review-demo/pulls):
 
-## ⚡ One-Click Deploy to Cloudflare
-
-Each track lives in its own fully self-contained directory, so Cloudflare's Deploy to Workers button can target either one directly and deploy *exactly* that track — not a mix of the two.
-
-**Starter Track** (`starter/` — single-file reviewer, ten minutes to set up):
-
-<a href="https://deploy.workers.cloudflare.com/?url=https://github.com/Clawbuilders/cloudflare-code-reviewer/tree/main/starter">
-  <img src="https://deploy.workers.cloudflare.com/button" alt="Deploy Starter Track to Cloudflare" height="38"/>
-</a>
-
-**Advanced Track** (repo root — full 7-pillar suite, Durable Objects, multi-model committee):
-
-<a href="https://deploy.workers.cloudflare.com/?url=https://github.com/Clawbuilders/cloudflare-code-reviewer">
-  <img src="https://deploy.workers.cloudflare.com/button" alt="Deploy Advanced Track to Cloudflare" height="38"/>
-</a>
-
-> Each button's deploy command is auto-detected from that directory's own `package.json` (`npm run deploy`) — there's no shared root dependency between the two, so one button can never accidentally deploy the other track.
+| PR | What the agent did |
+|---|---|
+| [#1 Docs-only change](https://github.com/kravchuk-ivan/cf-review-demo/pull/1) | Clef classified it `docs_or_config` and skipped the expensive models. |
+| [#2 Add lodash](https://github.com/kravchuk-ivan/cf-review-demo/pull/2) | Live OSV.dev lookup found 6 GHSA advisories; deps.dev flagged low OpenSSF Scorecard checks. |
+| [#3 Add export endpoint](https://github.com/kravchuk-ivan/cf-review-demo/pull/3) | Flagged command injection and path traversal, with a one-click fix on the vulnerable lines. |
 
 ---
 
-## 🛡️ The 7-Pillar Security Harness Suite
+## What's different from upstream
 
-A Cloudflare Worker is a V8 isolate — it **cannot** execute native binaries (no `gitleaks`, `semgrep`, or `opa` executables) without a paid [Cloudflare Sandbox](https://developers.cloudflare.com/sandbox/) container. So this pipeline is honest about what's actually running:
+- **Clef triage instead of Jev.** The triage gate calls `@cf/cloudflare/clef-flash`, Cloudflare's first-party decision model. Upstream used `typesafe/jev`, which is billed through AI Gateway credits and fails on a free account with `2021: Insufficient AI Gateway credits`.
+- **Inline one-click suggestions.** Code-quality findings are posted through the Pull Request Reviews API, anchored to the exact diff lines, so GitHub renders a **Commit suggestion** button. Suggestion ranges are re-aligned against the real file before posting, so committing one never duplicates or breaks code. Suggestions that only repeat existing code are dropped.
+- **Cleaner summaries.** The lead arbiter outputs a one-line verdict plus one badged bullet per finding, instead of restating its own checklist.
+- **One-command GitHub App setup.** `npm run setup:github-app` registers the App, stores its secrets in the Worker, and redeploys.
 
-- **REAL** = calls a live, public, unauthenticated HTTP API. No binary needed — this is exactly what a free-tier Worker can legitimately do.
-- **HEURISTIC** = a hand-rolled JS re-implementation of the named project's rule *ideas* (regex/path-matching), not the actual tool.
+---
 
-| # | Pillar & Repository | Kind | Specialty in the PR Agent Pipeline |
+## How it works
+
+```
+GitHub pull_request webhook
+        │
+        ▼
+Cloudflare Worker  ──  verifies the HMAC signature
+        │
+        ▼
+Durable Object (PrReviewCoordinator)
+  15s debounce, so a burst of pushes produces one review
+  SQLite review history per PR
+        │
+        ▼
+Deterministic checks (no LLM)
+  1  Secret scan (Gitleaks patterns)        blocks the PR on a hit
+  2  OSV.dev vulnerability lookup           live API
+  3  Hard-rails filter                      drops lockfiles, bundles, vendor code
+  4  Policy gate (OPA-inspired)             CI/CD, auth, infra, blast radius
+  7  OpenSSF Scorecard via deps.dev         live API
+        │
+        ▼
+3.5  Clef triage gate (clef-flash)
+  needs security review? needs quality review? category?
+  any real finding from 2/4 forces the security pass
+  neither needed → short comment, committee skipped
+        │
+        ▼
+Committee (parallel, only the specialists Clef asked for)
+  5  Security: DeepSeek-R1 Distill + full-file context for reachability
+     Quality:  Qwen 2.5 Coder → JSON findings anchored to diff lines
+        │
+        ▼
+6  Lead arbiter: Llama 3.3 70B
+   dedupes, drops false alarms, checks fixes for regressions
+        │
+        ▼
+GitHub review: summary + inline ```suggestion comments
+(falls back to a plain PR comment if GitHub rejects the review)
+```
+
+### The pillars
+
+A Worker is a V8 isolate and can't run native binaries such as `gitleaks`, `semgrep`, or `opa`. Each pillar is labeled with what actually runs:
+
+- **REAL**: calls a live public API or model.
+- **HEURISTIC**: a JavaScript re-implementation of the named project's rule ideas, not the tool itself.
+
+| # | Pillar | Kind | What it does |
 |---|---|---|---|
-| **1** | 🔑 **[gitleaks/gitleaks](https://github.com/gitleaks/gitleaks)**-pattern scan | HEURISTIC | Zero-tolerance regex scan for hardcoded API keys, Stripe/AWS/Slack/GitHub tokens, private key blocks, and `.env` leaks. Blocks the PR outright if found. |
-| **2** | 📦 **[osv.dev](https://osv.dev)** vulnerability lookup | **REAL** | New `package.json` dependencies are batch-queried live against Google's public OSV vulnerability database — real CVE/GHSA IDs, not a guess. |
-| **3** | 🔍 Hard-Rails file filter (Alibaba OCR-style) | HEURISTIC | Strips lockfiles, bundles, and vendor code before spending LLM tokens. Not a Semgrep integration — SAST-style reasoning happens in the LLM pass (Pillar 5). |
-| **3.5** | 🎯 **[typesafe/jev](https://developers.cloudflare.com/ai/models/typesafe/jev/)** triage gate | **REAL** | Cloudflare's calibrated decision model judges whether the diff needs the security specialist, the quality specialist, both, or neither — a docs-only or dependency-bump PR skips the multi-model committee entirely. A real OSV.dev/policy-gate finding always forces the security pass regardless of what Jev says; it can only add scrutiny, never suppress a deterministic one. |
-| **4** | 🛡️ **[open-policy-agent/opa](https://github.com/open-policy-agent/opa)**-inspired policy gate | HEURISTIC | Flags changes to CI/CD workflows (`.github/workflows/`), auth code, or infra config, and PRs over a blast-radius file-count threshold. *(Real OPA is possible: compile a Rego policy to WASM with `opa build -t wasm` and evaluate it with [`@open-policy-agent/opa-wasm`](https://github.com/open-policy-agent/npm-opa-wasm) — a good stretch goal, not built here since it needs a build step.)* |
-| **5** | 🧰 **[google/mantis](https://github.com/google/mantis)**-style reachability check | **REAL context** | Pulls the *full file* (not just the diff hunk) for changed files via the GitHub Contents API, so the security model can judge whether a flaw is actually reachable instead of pattern-matching a hunk in isolation. |
-| **6** | 🧪 **[OWASP/Agent-Security-Regression-Harness](https://github.com/OWASP/Agent-Security-Regression-Harness)**-style regression gate | HEURISTIC | The Lead Arbiter (Llama 3.3 70B) is instructed to verify proposed fixes introduce zero secondary vulnerabilities before posting. *(The real OWASP harness is an external, executable regression suite meant to run in CI against a deployed agent endpoint — a good companion GitHub Action, not something that runs inside the Worker itself.)* |
-| **7** | 📊 **[deps.dev](https://deps.dev)** OpenSSF Scorecard check | **REAL** | New dependencies are resolved to their source repo and checked live against the OpenSSF Scorecard (maintenance activity, code review practices, branch protection) via deps.dev's public API. |
+| 1 | [Gitleaks](https://github.com/gitleaks/gitleaks)-pattern secret scan | HEURISTIC | Regex scan for AWS, Stripe, Slack and GitHub tokens, private keys, and `.env` leaks. Blocks the PR on a hit. |
+| 2 | [OSV.dev](https://osv.dev) lookup | REAL | Batch-queries new `package.json` dependencies for known CVEs and GHSAs. |
+| 3 | Hard-rails file filter | HEURISTIC | Alibaba [OCR](https://github.com/alibaba/open-code-review)-style noise reduction before any tokens are spent. |
+| 3.5 | [Clef](https://developers.cloudflare.com/workers-ai/models/clef-flash/) triage gate | REAL | Calibrated yes/no confidences decide which specialists run. It can add scrutiny but never suppress a deterministic finding. |
+| 4 | [OPA](https://github.com/open-policy-agent/opa)-inspired policy gate | HEURISTIC | Flags CI/CD workflow, auth and infra changes, and PRs over a file-count threshold. |
+| 5 | [Mantis](https://github.com/google/mantis)-style reachability | REAL context | Fetches full changed files through the Contents API so the security model judges reachability, not just the hunk. |
+| 6 | [OWASP ASRH](https://github.com/OWASP/Agent-Security-Regression-Harness)-style regression gate | HEURISTIC | The arbiter is instructed to reject fixes that introduce secondary vulnerabilities. |
+| 7 | [deps.dev](https://deps.dev) OpenSSF Scorecard | REAL | Resolves new dependencies to their source repo and flags low Scorecard checks. |
 
 ---
 
-## 🧠 Multi-Harness + Multi-Model Pipeline
+## Quickstart (Advanced Track)
 
-```
-                 GitHub PR Webhook
-                         │
-                         ▼
-              Cloudflare Edge Worker
-                         │
-                         ▼
-        Durable Object (PrReviewCoordinator)
-         - 15s Push Debounce Timer
-         - SQLite PR State & History
-                         │
-         ┌───────────────┼───────────────┬───────────────┐
-         ▼               ▼               ▼               ▼
-   [Pillar 1]      [Pillar 2]      [Pillar 3]      [Pillar 4]
-  Gitleaks-pattern  osv.dev API    Hard-Rails      OPA-inspired
-   Secret Scan     (REAL — CVEs)   File Filter    Policy/Blast Radius
-  (heuristic)                     (heuristic)      (heuristic)
-         │               │               │               │
-         └───────────────┼───────────────┴───────────────┘
-                         │
-                         ▼
-              [Pillar 7] deps.dev Scorecard
-              (REAL — supply-chain check)
-                         │
-                         ▼
-              [Pillar 3.5] Jev Triage Gate
-         needs_security? needs_quality? category?
-      (forced on by any real Pillar 2/4/7 finding)
-                         │
-      ┌──────────────────┴──────────────────┐
-      │ Both skipped → short comment posted,│
-      │ committee never runs (early return) │
-      └──────────────────┬──────────────────┘
-                         │ (at least one needed)
-        ┌────────────────┴────────────────┐
-        │ Parallel Review via Promise.all,│
-        │ each proxied through AI Gateway │
-        ▼                                 ▼
-[Pillar 5: Security Specialist]   [Code Quality Specialist]
-DeepSeek-R1 Distill               Alibaba Qwen 2.5 Coder
-+ full-file context (REAL) for    (Clean Code & Diffs)
-  Mantis-style reachability          (only if needs_quality)
-     (only if needs_security)
-        │                                 │
-        └────────────────┬────────────────┘
-                         │
-                         ▼
-                Lead Review Arbiter
-                 Meta Llama 3.3 70B
-     + [Pillar 6: OWASP-ASRH-style Regression]
-            (Deduplicates & Removes Noise)
-                         │
-                         ▼
-           GitHub PR Comment (```suggestion
-             blocks — copy-paste, not a
-             one-click Review API suggestion)
-```
+Requires Node 20+, a Cloudflare account (the free plan works), and a GitHub account or org where you can create Apps.
 
----
-
-## 🧭 Two Tracks, Two Isolated Directories
-
-### 1. 🚀 Starter Track (`starter/src/index.ts`)
-*   **Concept**: Deploy your first automated PR reviewer in 10 minutes.
-*   **Architecture**: Single stateless Cloudflare Worker + Workers AI (Alibaba Qwen 2.5 Coder). Its own `package.json`/`wrangler.json` — no dependency on the repo root.
-*   **Run Locally**: `cd starter && npm install && npm run dev`
-*   **Deploy**: `cd starter && npm run deploy` (or click the **Starter** button above!)
-
-### 2. ⚡ Advanced Track (`src/index.ts` — repo root)
-*   **Concept**: Full Alibaba OCR architecture with the 7-pillar security suite, SQLite Durable Objects, debouncing, and multi-model committee.
-*   **Run Locally**: `npm run dev`
-*   **Deploy**: `npm run deploy` (or click the **Advanced** button above!)
-
----
-
-## 🚀 Local Quickstart
-
-### 1. Clone
+### 1. Install and deploy
 
 ```bash
-git clone https://github.com/Clawbuilders/cloudflare-code-reviewer.git
+git clone https://github.com/kravchuk-ivan/cloudflare-code-reviewer.git
 cd cloudflare-code-reviewer
+npm install
+npx wrangler login
+npm run deploy
 ```
 
-Pick a track — each has its own dependencies, so `npm install` runs separately per directory.
+Note the Worker URL it prints, e.g. `https://cloudflare-code-reviewer.<you>.workers.dev`.
 
-**Starter Track:**
+### 2. Create the GitHub App (one command)
+
+```bash
+npm run setup:github-app -- https://cloudflare-code-reviewer.<you>.workers.dev my-reviewer
+```
+
+This opens a browser page that registers an App through GitHub's [manifest flow](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest), already configured with:
+
+- Webhook pointed at `<worker>/webhook/github`, subscribed to `pull_request`.
+- Permissions: Contents read, Pull requests write, Issues write, Metadata read.
+
+After you confirm on GitHub, the script:
+
+1. Converts the private key to PKCS#8 in memory and stores it as the `GITHUB_APP_PRIVATE_KEY` secret.
+2. Stores the webhook secret as `GITHUB_WEBHOOK_SECRET`.
+3. Writes the App ID into `wrangler.json`.
+4. Redeploys the Worker.
+5. Redirects you to the App's install page.
+
+The key never touches disk or your terminal.
+
+### 3. Install the App and open a PR
+
+Install the App on the repos to review, then open a PR. The review lands in about 20–40 seconds, including the 15-second debounce.
+
+<details>
+<summary>Manual GitHub App setup (if you can't use the script)</summary>
+
+1. Go to `github.com/organizations/<org>/settings/apps/new` (or your personal settings → Developer settings → GitHub Apps).
+2. Leave "bot" out of the name. GitHub appends `[bot]` itself.
+3. Delete the empty callback URL row. No user OAuth is needed.
+4. **Webhook**: active, URL `<worker>/webhook/github`. Generate a secret and save it, because GitHub shows it only once.
+5. **Permissions**: Contents read-only, Pull requests read & write, Issues read & write.
+6. **Subscribe to events → Pull request.** Setting the permission does *not* subscribe you to the event. Without this checkbox GitHub delivers nothing, silently.
+7. Create the App, note the **App ID**, and generate a private key.
+8. Convert the key: `openssl pkcs8 -topk8 -nocrypt -in key.pem -out pkcs8-key.pem`
+9. Set the secrets and the ID:
+   ```bash
+   npx wrangler secret put GITHUB_APP_PRIVATE_KEY   # paste pkcs8-key.pem
+   npx wrangler secret put GITHUB_WEBHOOK_SECRET
+   ```
+   Then put the App ID in `wrangler.json` → `vars.GITHUB_APP_ID` and run `npm run deploy`.
+
+Never paste private-key material into a chat or AI assistant. If it leaks, generate a new key; that invalidates the old one immediately.
+</details>
+
+---
+
+## Configuration
+
+| Name | Where | Purpose |
+|---|---|---|
+| `GITHUB_APP_ID` | `wrangler.json` vars | Your App's ID. Not secret. |
+| `GITHUB_APP_PRIVATE_KEY` | Worker secret | PKCS#8 private key used to mint installation tokens. |
+| `GITHUB_WEBHOOK_SECRET` | Worker secret | Verifies the `X-Hub-Signature-256` header on incoming webhooks. |
+| `JEV_ESCALATION_FLOOR` | `wrangler.json` vars | Confidence threshold (default `0.5`) above which Clef sends a diff to a specialist. Lower it for more reviews, raise it to skip more. The name is kept from upstream for compatibility. |
+| `AI_GATEWAY_NAME` | `wrangler.json` vars (optional) | Routes every model call through that AI Gateway for caching, logs and analytics. Create the gateway first; an unknown name causes errors. |
+
+The installation ID isn't configured anywhere. It arrives on every webhook as `payload.installation.id`.
+
+---
+
+## Private repositories
+
+- An unauthenticated fetch of `github.com/.../pull/N.diff` on a private repo returns a 404 HTML page, which parses as zero files, and the review silently stops.
+- That web route also rejects App installation tokens. This Worker fetches the diff from `GET /repos/{owner}/{repo}/pulls/{n}` with `Accept: application/vnd.github.v3.diff`, which works with App tokens.
+- Every GitHub call checks `response.ok` and logs failures, so problems show up in `wrangler tail` instead of disappearing.
+
+---
+
+## Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| No review, no Worker logs | App → **Advanced → Recent Deliveries**. If nothing was delivered, the App isn't subscribed to the `pull_request` event. |
+| Delivery shows 401 | `GITHUB_WEBHOOK_SECRET` doesn't match the App's webhook secret. |
+| Review posted, but no inline comments | GitHub rejected the inline review (e.g. the head SHA moved mid-review). The Worker falls back to a plain comment with the suggestions inlined. Push again to re-run. |
+| "Clef was unavailable this run" | Clef errored and triage used the Llama fallback. Run `npx wrangler tail` to see the error. |
+| Anything else | Run `npx wrangler tail --format pretty` and push an empty commit to the PR: `git commit --allow-empty -m "Re-run review" && git push`. |
+
+---
+
+## Starter Track
+
+`starter/` is a separate, single-file reviewer: one stateless Worker plus Qwen 2.5 Coder. It posts as you using a personal access token instead of a GitHub App. It has its own `package.json` and `wrangler.json`.
+
 ```bash
 cd starter
 npm install
-npm run dev        # http://localhost:8787
+npm run deploy
+npx wrangler secret put GITHUB_TOKEN   # classic PAT with `repo`, or fine-grained with Pull requests: RW + Contents: R
 ```
 
-**Advanced Track** (from the repo root instead):
-```bash
-npm install
-npm run dev        # http://localhost:8787
-```
+Then add a repo webhook (Settings → Webhooks):
 
-### 2. Deploy to Cloudflare
-```bash
-npx wrangler login
-npm run deploy      # run from starter/ or the repo root, depending on the track
-```
+- Payload URL: the Starter Worker's root URL (it accepts `POST /`).
+- Content type: `application/json`.
+- Events: **Pull requests**.
 
-### 3. Starter Track: Configure GitHub Token (Secret)
-
-The Starter Track posts as *you* — a plain Personal Access Token, no app registration needed. A classic PAT needs the `repo` scope; a fine-grained PAT needs **Pull requests: Read and write** (plus **Contents: Read**) on the target repo.
-
-**CLI** (run from `starter/`):
-```bash
-npx wrangler secret put GITHUB_TOKEN
-```
-
-**Or via the dashboard** (no terminal needed — useful if you'd rather not type a token into a CLI prompt):
-1. [dash.cloudflare.com](https://dash.cloudflare.com) → **Workers & Pages**.
-2. Click into `cloudflare-code-reviewer-starter` → **Settings** tab → **Variables and Secrets** → **Add**.
-3. Type **Secret** · Name `GITHUB_TOKEN` · Value your PAT → **Save and deploy**.
-
-### 3b. Advanced Track: Configure the GitHub App (required — no PAT option)
-
-The Advanced Track posts exclusively as a real bot identity — a GitHub App, not your personal account (`clawbuilders-code-reviewer[bot]` in the reference deployment). There's no PAT fallback here; the App is a required ~5-minute step, not optional. These are exactly the steps (and gotchas) from building the reference deployment:
-
-1. Register under your **org** (not personal account): `github.com/organizations/<org>/settings/apps/new`.
-2. Name it **without** "bot" in the name — GitHub auto-appends `[bot]` in comments (`cf-pr-reviewer` → `cf-pr-reviewer[bot]`).
-3. Skip **Identifying and authorizing users** entirely (delete the empty Redirect URI row) — no OAuth user-login flow needed for a bot identity.
-4. **Webhook**: Active, URL = your deployed worker's `/webhook/github`. Generate + save the webhook secret immediately — GitHub only shows it once.
-5. **Permissions**: only **Contents → Read-only** and **Pull requests → Read and write**. Skip Organization/Account/Enterprise.
-6. ⚠️ **The step everyone misses**: setting the Pull Requests permission does *not* auto-subscribe you to the `pull_request` event. A separate checkbox appears under **Subscribe to events** once that permission is set — check it, or GitHub delivers **nothing**, silently, forever. If this happens to you, diagnose it via the App's own **Settings → Advanced → Recent Deliveries** log (not the Worker's logs — nothing ever arrived there to log).
-7. **Where can this be installed?** → Only on this account.
-8. **Create GitHub App**, then **Generate a private key** (downloads a `.pem`) and note the **App ID** on the same page.
-9. **Install App** on just the target repo(s).
-
-Convert the key format — GitHub gives you PKCS#1, Cloudflare's Web Crypto needs PKCS#8:
-```bash
-openssl pkcs8 -topk8 -nocrypt -in downloaded-key.pem -out pkcs8-key.pem
-```
-
-Set two secrets on the **Advanced worker** (`cloudflare-code-reviewer`), same dashboard/CLI steps as above:
-- `GITHUB_APP_PRIVATE_KEY` — full contents of the converted `pkcs8-key.pem`.
-- `GITHUB_WEBHOOK_SECRET` — the secret from step 4.
-
-`GITHUB_APP_ID` isn't sensitive — it's already baked into `wrangler.json`'s `vars`, no secret needed. `installation_id` isn't configured anywhere either — it arrives automatically on every webhook payload (`payload.installation.id`) since App webhooks are already scoped per-installation; see `src/github-app-auth.ts` for the JWT-signing + installation-token exchange (plain `crypto.subtle`, no npm deps).
-
-`JEV_ESCALATION_FLOOR` (also a plain `wrangler.json` var, default `0.5`) is the Noul-probability floor the Jev triage gate uses to decide a diff needs a given specialist — lower it to run the committee more often (more cautious, more expensive), raise it to skip more aggressively. It's a starting point, not a validated threshold; tune it against this repo's own PR traffic before trusting it on anything that matters.
-
-> **Never let raw private-key material pass through a chat/AI coding assistant** — copy it directly from the local file into the Cloudflare dashboard. If it ever leaks into a session anyway, treat it as compromised and rotate immediately (Generate a new private key invalidates the old one instantly).
-
-### 3c. ⚠️ Private repos need one more thing than public repos do
-
-Both tracks were originally built and demoed against **this repo**, which is public — a diff fetch against a public repo's `pr.diff_url` (`github.com/OWNER/REPO/pull/N.diff`) works with no auth header at all. Point either track at a **private** repo and that changes:
-
-- **The diff fetch needs auth too, not just the comment post.** An unauthenticated request to a private repo's `pr.diff_url` returns a `404` — which is GitHub's HTML error page, not a diff. `parseDiff()` on that HTML yields zero files, and both tracks treat "zero reviewable files" as "nothing to review" and quietly stop. No exception, no failed request in your logs — the Worker looks like it ran fine. Fix: send the same `Authorization: token <...>` header on the diff fetch that you already send on the comment-posting fetch.
-- **On the Advanced Track (GitHub App auth), that's still not enough.** Even a real, successfully-minted App installation token gets a `404` from that same `pull/N.diff` web route on a private repo — it doesn't reliably honor App tokens the way the REST API does. `src/index.ts` fetches the diff from `GET https://api.github.com/repos/{owner}/{repo}/pulls/{number}` with `Accept: application/vnd.github.v3.diff` instead, which is the documented way to get a diff and works correctly with an App token on a private repo. If you fork the Starter Track to use App auth instead of a plain PAT, use the same endpoint — `starter/src/index.ts` already does.
-- **Both tracks now fail loudly instead of silently.** Every GitHub-bound `fetch()` call checks `response.ok` and logs (`console.error` on the Advanced Track, a `502` response body on the Starter Track) instead of assuming a non-throwing `fetch()` means success — `fetch()` never throws on a 4xx/5xx, so an unchecked response used to look identical to a successful post in every log available.
-
-This is exactly what happened deploying the reference App against a real private production repo: the App was installed correctly, permissioned correctly, and the webhook was delivered correctly — and it still never posted a single review until both of the above were fixed. See `docs/workshop-guide.md` §8 Troubleshooting #7 for the full writeup.
-
-### 4. (Optional) Enable AI Gateway caching
-
-By default the agent calls Workers AI directly — no gateway, no caching. To turn on the 24h diff cache, fallback routing, and observability:
-
-1. Dashboard → **AI** → **AI Gateway** → **Create Gateway** (any name).
-2. Add it to that track's `wrangler.json` (`starter/wrangler.json` or the root one):
-   ```json
-   "vars": { "AI_GATEWAY_NAME": "your-gateway-name" }
-   ```
-3. Redeploy. Every `env.AI.run()` call already checks for `AI_GATEWAY_NAME` and routes through it automatically when present — no code changes needed.
-
-> This is opt-in on purpose: a gateway ID that doesn't exist yet returns an error, so shipping a hardcoded default would break the demo for anyone who skips this step.
+Optionally set a webhook secret and store it with `npx wrangler secret put GITHUB_WEBHOOK_SECRET` to enforce signature checks.
 
 ---
 
-## 📜 License
-Apache-2.0. Built with ❤️ by [ClawBuilders](https://clawbuilder.club).
+## Project layout
+
+```
+src/index.ts                 Advanced Track: webhook, Durable Object, pillars, committee, GitHub posting
+src/github-app-auth.ts       App JWT signing + installation-token exchange (Web Crypto, no deps)
+scripts/create-github-app.mjs  One-command GitHub App registration
+starter/                     Starter Track (independent package)
+docs/workshop-guide.md       Original workshop guide, including the OCR research and facilitator notes
+wrangler.json                Worker, AI binding, Durable Object, vars
+```
+
+Local development: `npm run dev` serves on `http://localhost:8787`. Webhooks need a public URL, so test end to end against the deployed Worker.
+
+---
+
+## License
+
+Apache-2.0. Original project by [ClawBuilders](https://clawbuilder.club).
