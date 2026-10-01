@@ -541,6 +541,211 @@ async function postPrComment(commentsUrl: string, token: string, body: string): 
   }
 }
 
+// ── Inline Review Suggestions (GitHub Pull Request Reviews API) ────────────────
+// A ```suggestion block only becomes a one-click "Commit suggestion" button
+// when it lives in a review comment anchored to a line of the diff — inside
+// an issue comment it's just a code block. GitHub rejects the entire review
+// (422) if any comment points at a line outside the diff's hunks, so every
+// finding is validated against the set of commentable new-file lines first.
+
+interface InlineFinding {
+  path: string;
+  startLine?: number;
+  line: number;
+  title: string;
+  body: string;
+  suggestion?: string;
+}
+
+// path → (new-file line number → line text) for every line in the diff
+// (added or context). These are exactly the RIGHT-side lines GitHub accepts
+// comments on.
+function commentableLines(files: parseDiff.File[]): Map<string, Map<number, string>> {
+  const map = new Map<string, Map<number, string>>();
+  for (const file of files) {
+    if (!file.to || file.to === '/dev/null') continue;
+    const lines = new Map<number, string>();
+    for (const chunk of file.chunks) {
+      for (const change of chunk.changes) {
+        if (change.type === 'add') lines.set(change.ln, change.content.slice(1));
+        else if (change.type === 'normal') lines.set(change.ln2, change.content.slice(1));
+      }
+    }
+    map.set(file.to, lines);
+  }
+  return map;
+}
+
+const leadingWhitespace = (s: string) => s.match(/^\s*/)![0];
+
+// Models routinely (a) strip indentation from suggestions and (b) rewrite the
+// lines *after* the cited one without widening the range — committing that
+// suggestion would duplicate those lines. Both are fixable deterministically
+// against the real file lines, so the one-click button produces valid code.
+function fitSuggestion(f: InlineFinding, lines: Map<number, string>): InlineFinding {
+  if (f.suggestion === undefined) return f;
+  let suggestion = f.suggestion.split('\n');
+  let line = f.line;
+
+  // (b) Widen the range backward while the suggestion's leading lines repeat
+  // the lines just above it (the model rewrote 9–11 but cited 10), then
+  // forward while its trailing lines repeat the lines that follow it — they
+  // were meant to be replaced, not duplicated.
+  let startLine = f.startLine ?? f.line;
+  for (let m = suggestion.length - 1; m > 0; m--) {
+    let matches = true;
+    for (let k = 0; k < m && matches; k++) {
+      const orig = lines.get(startLine - m + k);
+      matches = orig !== undefined && suggestion[k].trim() === orig.trim();
+    }
+    if (matches) {
+      startLine -= m;
+      break;
+    }
+  }
+  const prepended = (f.startLine ?? f.line) - startLine;
+  for (let k = suggestion.length - 1 - prepended; k > 0; k--) {
+    let matches = true;
+    for (let j = 1; j <= k && matches; j++) {
+      const orig = lines.get(line + j);
+      matches = orig !== undefined && suggestion[suggestion.length - 1 - k + j].trim() === orig.trim();
+    }
+    if (matches) {
+      line += k;
+      break;
+    }
+  }
+
+  // (a) Re-indent so the first line matches the original's indentation;
+  // lines the suggestion leaves unchanged keep their original text verbatim.
+  const want = leadingWhitespace(lines.get(startLine) ?? '');
+  const have = leadingWhitespace(suggestion[0]);
+  const pad = want.length > have.length && suggestion[0].trim() !== '' ? want.slice(have.length) : '';
+  suggestion = suggestion.map((s, i) => {
+    const orig = lines.get(startLine + i);
+    if (orig !== undefined && startLine + i <= line && s.trim() === orig.trim()) return orig;
+    return s.trim() === '' ? s : pad + s;
+  });
+
+  return { ...f, startLine: line > startLine ? startLine : undefined, line, suggestion: suggestion.join('\n') };
+}
+
+// Renders the diff with explicit new-file line numbers so the model can cite
+// a line GitHub will accept, instead of guessing from raw hunk headers.
+function renderNumberedDiff(files: parseDiff.File[], maxChars = 12000): string {
+  const out: string[] = [];
+  for (const file of files) {
+    if (!file.to || file.to === '/dev/null') continue;
+    out.push(`=== ${file.to} ===`);
+    for (const chunk of file.chunks) {
+      for (const change of chunk.changes) {
+        const text = change.content.slice(1);
+        if (change.type === 'add') out.push(`${String(change.ln).padStart(4)} + ${text}`);
+        else if (change.type === 'normal') out.push(`${String(change.ln2).padStart(4)}   ${text}`);
+        else out.push(`     - ${text}`);
+      }
+    }
+  }
+  return out.join('\n').slice(0, maxChars);
+}
+
+// Workers AI hands back already-parsed JSON when the model's whole output is
+// valid JSON, so `response` may be an array/object rather than a string.
+function parseInlineFindings(response: unknown): InlineFinding[] {
+  let raw: any = response;
+  if (typeof response === 'string') {
+    // R1-style models may prefix their answer with a <think> block.
+    const cleaned = response.replace(/<think>[\s\S]*?<\/think>/g, '');
+    const match = cleaned.match(/\[[\s\S]*\]/);
+    if (!match) return [];
+    try {
+      raw = JSON.parse(match[0]);
+    } catch {
+      return [];
+    }
+  }
+  if (raw && !Array.isArray(raw) && Array.isArray(raw.findings)) raw = raw.findings;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((f) => f && typeof f.path === 'string' && Number.isInteger(f.line) && typeof f.title === 'string')
+    .map((f) => ({
+      path: f.path,
+      startLine: Number.isInteger(f.start_line) && f.start_line < f.line ? f.start_line : undefined,
+      line: f.line,
+      title: f.title,
+      body: typeof f.body === 'string' ? f.body : '',
+      suggestion: typeof f.suggestion === 'string' ? f.suggestion.replace(/\n$/, '') : undefined,
+    }));
+}
+
+// Drops findings GitHub would reject: unknown path, or any line of the
+// (start_line..line) range falling outside the diff.
+function anchorFindings(findings: InlineFinding[], files: parseDiff.File[]): InlineFinding[] {
+  const lines = commentableLines(files);
+  return findings
+    .filter((f) => {
+      const valid = lines.get(f.path);
+      if (!valid) return false;
+      for (let ln = f.startLine ?? f.line; ln <= f.line; ln++) {
+        if (!valid.has(ln)) return false;
+      }
+      return true;
+    })
+    .map((f) => fitSuggestion(f, lines.get(f.path)!))
+    // A suggestion identical to the lines it replaces is a false alarm —
+    // the model "fixed" code that was already correct.
+    .filter((f) => {
+      if (f.suggestion === undefined) return true;
+      const valid = lines.get(f.path)!;
+      const original: string[] = [];
+      for (let ln = f.startLine ?? f.line; ln <= f.line; ln++) original.push(valid.get(ln)!.trim());
+      return f.suggestion.split('\n').map((s) => s.trim()).join('\n') !== original.join('\n');
+    });
+}
+
+function renderInlineComment(f: InlineFinding): Record<string, unknown> {
+  const suggestion = f.suggestion !== undefined ? `\n\n\`\`\`suggestion\n${f.suggestion}\n\`\`\`` : '';
+  const comment: Record<string, unknown> = {
+    path: f.path,
+    line: f.line,
+    side: 'RIGHT',
+    body: `**${f.title}**\n\n${f.body}${suggestion}`,
+  };
+  if (f.startLine !== undefined) {
+    comment.start_line = f.startLine;
+    comment.start_side = 'RIGHT';
+  }
+  return comment;
+}
+
+// Posts the arbiter summary as the review body with each anchored finding as
+// an inline comment. Returns false on failure so the caller can fall back to
+// a plain issue comment rather than dropping the review.
+async function postPrReview(
+  repoFullName: string,
+  prNumber: number,
+  commitSha: string,
+  token: string,
+  body: string,
+  findings: InlineFinding[]
+): Promise<boolean> {
+  const res = await fetch(`https://api.github.com/repos/${repoFullName}/pulls/${prNumber}/reviews`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `token ${token}`,
+      'User-Agent': 'Cloudflare-Code-Reviewer',
+      'Accept': 'application/vnd.github+json',
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ commit_id: commitSha, event: 'COMMENT', body, comments: findings.map(renderInlineComment) })
+  });
+  if (!res.ok) {
+    console.error(`Failed to post PR review: ${res.status} ${res.statusText} — ${await res.text()}`);
+    return false;
+  }
+  return true;
+}
+
 // ── Durable Object: State, Debounce & Multi-Model Committee ────────────────────
 export class PrReviewCoordinator extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -672,6 +877,7 @@ export class PrReviewCoordinator extends DurableObject<Env> {
       }
 
       const diffHunk = JSON.stringify(reviewableFiles.slice(0, 5));
+      const numberedDiff = renderNumberedDiff(reviewableFiles.slice(0, 5));
 
       // ── JEV TRIAGE GATE: which specialist(s) does this diff actually need? ──
       // Falls back through a free-tier model, then fails open, if Jev itself
@@ -751,19 +957,28 @@ If nothing is reachable and exploitable, respond with NONE.`
                 {
                   role: 'system',
                   content: `You are a staff software engineer performing code review following Alibaba OCR rules.
-For any issue found:
-1. State the file and line number.
-2. Explain the defect succinctly.
-3. Provide the exact fix formatted as a GitHub suggestion block:
-\`\`\`suggestion
-<replacement code>
-\`\`\``
+The diff is shown with new-file line numbers in the left column ("+" = added line, blank = unchanged context, "-" = removed line with no number).
+Report only substantive defects (bugs, security issues, missing error handling), not style nitpicks.
+Respond with ONLY a JSON array, no prose, no markdown fences. Each element:
+{"path": "<file path exactly as shown after ===>", "start_line": <optional first line number of a multi-line range>, "line": <line number>, "title": "<short defect name>", "body": "<one or two sentences explaining the defect>", "suggestion": "<exact replacement code for lines start_line..line (or just line), preserving indentation>"}
+Only cite numbered lines. Omit "suggestion" if the fix can't be expressed as a replacement of those exact lines. Return [] if there are no substantive issues.`
                 },
-                { role: 'user', content: diffHunk }
+                { role: 'user', content: numberedDiff }
               ]
             }, gatewayOpts)
           : Promise.resolve(null)
       ]);
+
+      // Qwen's findings become inline review comments; only those anchored to
+      // a real diff line survive, and the arbiter sees them as a plain list.
+      const inlineFindings = codeReport
+        ? anchorFindings(parseInlineFindings(codeReport.response), reviewableFiles)
+        : [];
+      const codeReportSummary = !codeReport
+        ? 'Skipped — Jev triage found no substantive quality signal in this diff'
+        : inlineFindings.length === 0
+          ? 'No substantive issues found'
+          : inlineFindings.map((f) => `${f.path}:${f.line} — ${f.title}: ${f.body}`).join('\n');
 
       // ── PILLAR 6: OWASP-ASRH-style Regression Check + Lead Arbiter Synthesis ─
       const finalSynthesis = await this.env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
@@ -775,7 +990,8 @@ For any issue found:
 - OSV.dev Vulnerability Lookup: ${vulnerabilityFindings.length > 0 ? vulnerabilityFindings.join('; ') : 'No known vulnerabilities in changed dependencies'}
 - OpenSSF Scorecard Supply-Chain Check: ${scorecardFindings.length > 0 ? scorecardFindings.join('; ') : 'No low-scoring dependencies flagged'}
 - Security Specialist (Mantis-style reachability): ${securityReport ? securityReport.response : 'Skipped — Jev triage found no plausible security signal in this diff'}
-- Code Quality Specialist (Qwen 2.5 Coder): ${codeReport ? codeReport.response : 'Skipped — Jev triage found no substantive quality signal in this diff'}
+- Code Quality Specialist (Qwen 2.5 Coder): ${codeReportSummary}
+${inlineFindings.length > 0 ? `\nThe Code Quality findings above are already posted as inline comments with one-click suggestions on the exact lines — reference them briefly, do not repeat their code fixes.\n` : ''}
 
 Verification Checklist:
 1. Ensure proposed fixes introduce ZERO secondary regressions or permission leaks.
@@ -797,11 +1013,16 @@ Apply this checklist silently. Output ONLY the final review a developer reads: a
 
       // Post final review back to GitHub PR
       if (githubToken) {
-        await postPrComment(
-          pr.comments_url,
-          githubToken,
-          `### 🛡️ AI Review Committee (7-Pillar Security Suite)\n*Gitleaks-pattern • OSV.dev (live) • Hard-Rails Filter • Jev Triage Gate • OPA-inspired Policy • Mantis-style Reachability • OWASP-ASRH-style Regression • OpenSSF Scorecard (live)*\n\n${!triage.needsSecurity ? '_Security specialist skipped by Jev triage for this PR._\n\n' : ''}${!triage.needsQuality ? '_Code quality specialist skipped by Jev triage for this PR._\n\n' : ''}${triageSourceNote ? triageSourceNote.trim() + '\n\n' : ''}${finalSynthesis.response}`
-        );
+        const reviewBody = `### 🛡️ AI Review Committee (7-Pillar Security Suite)\n*Gitleaks-pattern • OSV.dev (live) • Hard-Rails Filter • Jev Triage Gate • OPA-inspired Policy • Mantis-style Reachability • OWASP-ASRH-style Regression • OpenSSF Scorecard (live)*\n\n${!triage.needsSecurity ? '_Security specialist skipped by Jev triage for this PR._\n\n' : ''}${!triage.needsQuality ? '_Code quality specialist skipped by Jev triage for this PR._\n\n' : ''}${triageSourceNote ? triageSourceNote.trim() + '\n\n' : ''}${finalSynthesis.response}`;
+        const posted = await postPrReview(repoFullName, pr.number, pr.head.sha, githubToken, reviewBody, inlineFindings);
+        if (!posted) {
+          // Inline anchoring failed (e.g. a stale head SHA) — still deliver the
+          // review, with the suggestions inlined as plain text.
+          const fallbackFindings = inlineFindings
+            .map((f) => `- \`${f.path}:${f.line}\` **${f.title}** — ${f.body}${f.suggestion !== undefined ? `\n  \`\`\`suggestion\n${f.suggestion}\n  \`\`\`` : ''}`)
+            .join('\n');
+          await postPrComment(pr.comments_url, githubToken, fallbackFindings ? `${reviewBody}\n\n${fallbackFindings}` : reviewBody);
+        }
       } else {
         console.error(
           `No githubToken resolved for ${repoFullName}#${pr.number} — review computed but not posted. ` +
