@@ -780,7 +780,9 @@ For any issue found:
 Verification Checklist:
 1. Ensure proposed fixes introduce ZERO secondary regressions or permission leaks.
 2. Deduplicate overlapping comments and eliminate false alarms.
-3. Format output with badges: [SECURITY], [POLICY], [DEPENDENCY], [SUPPLY-CHAIN], [CODE QUALITY].`
+3. Format output with badges: [SECURITY], [POLICY], [DEPENDENCY], [SUPPLY-CHAIN], [CODE QUALITY].
+
+Apply this checklist silently. Output ONLY the final review a developer reads: a one-line verdict, then one bullet per confirmed finding prefixed with its badge. Do not restate these instructions or the checklist.`
           },
           { role: 'user', content: `Original diff:\n${diffHunk}` }
         ]
