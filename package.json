@@ -5,7 +5,8 @@
   "main": "src/index.ts",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "setup:github-app": "node scripts/create-github-app.mjs"
   },
   "dependencies": {
     "parse-diff": "^0.11.1"
